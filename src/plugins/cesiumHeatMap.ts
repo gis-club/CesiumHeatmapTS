@@ -84,6 +84,13 @@ interface IBounding {
   west: number;
 }
 
+export interface IRenderTiming {
+  method: 'standard' | 'raster'
+  totalMs: number
+  dataPoints: number
+  pixelCount: number
+}
+
 const option2: IDefalutOption2 = {
   defaultRadius: 40,
   defaultRenderer: 'canvas2d',
@@ -283,6 +290,7 @@ class RendererClass {
   _useGradientOpacity!: boolean
   _min!:number
   _max!:number
+  _kernelCache: Map<string, Float32Array>
 
   constructor (allOption: AllOption) {
     const container = allOption.container ? allOption.container : document.createElement('div')
@@ -300,6 +308,7 @@ class RendererClass {
     container.appendChild(this.canvas)
     this._palette = this.setImage(allOption)
     this._setStyles(allOption)
+    this._kernelCache = new Map()
   }
 
   setImage (a: AllOption): Uint8ClampedArray {
@@ -508,6 +517,134 @@ class RendererClass {
     this._renderBoundaries = [1e3, 1e3, 0, 0]
   }
 
+  // ==================== 位图加速渲染 ====================
+
+  /**
+   * 创建位图径向梯度核函数。
+   *
+   * 将 Canvas 径向渐变模板光栅化到 Float32Array，后续通过数组索引 O(1) 读取，
+   * 避免每个数据点都调用 Canvas drawImage API。
+   * 核函数按 (radius, blur) 缓存，同参数只计算一次。
+   */
+  private _createBitmapKernel (radius: number, blur: number): Float32Array {
+    const key = `${radius}_${blur}`
+    const cached = this._kernelCache.get(key)
+    if (cached) return cached
+
+    const size = radius * 2
+    const kernel = new Float32Array(size * size)
+    const center = radius
+    const innerRadius = radius * blur
+
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const dx = x - center
+        const dy = y - center
+        const dist = Math.sqrt(dx * dx + dy * dy)
+
+        if (dist <= innerRadius) {
+          kernel[y * size + x] = 1.0
+        } else if (dist <= radius && innerRadius < radius) {
+          kernel[y * size + x] = 1.0 - (dist - innerRadius) / (radius - innerRadius)
+        }
+      }
+    }
+
+    this._kernelCache.set(key, kernel)
+    return kernel
+  }
+
+  /**
+   * 位图加速渲染（光栅化法）。
+   *
+   * 原理与 KrigingTS 中 rasterGrid 对 grid 的加速思路一致：
+   *   - renderAll() 对每个数据点调用 Canvas drawImage（含 globalAlpha 状态切换、
+   *     Canvas 合成运算），再通过 getImageData 读回像素做调色。
+   *   - rasterRenderAll() 将径向渐变模板预计算为 Float32Array（位图核），
+   *     对每个数据点直接在 TypedArray 上做 O(1) 索引累加（Porter-Duff source-over），
+   *     最后一次性写入 ImageData 并着色——全程零 Canvas 绘图 API 调用。
+   */
+  rasterRenderAll (a: IStore) {
+    this._clear()
+
+    const data = this.c(a)
+    const points = data.data || []
+    const min = data.min
+    const max = data.max
+    const width = this._width
+    const height = this._height
+    const blur = 1 - this._blur
+
+    if (points.length === 0 || width <= 0 || height <= 0) return
+
+    const alphaBuffer = new Float32Array(width * height)
+
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i]
+      const radius = point.radius!
+      const value = Math.min(point.value!, max)
+      const alpha = (value - min) / (max - min)
+      if (alpha <= 0) continue
+
+      const size = radius * 2
+      const kernel = this._createBitmapKernel(radius, blur)
+      const px = point.x - radius
+      const py = point.y - radius
+
+      for (let ky = 0; ky < size; ky++) {
+        const ty = py + ky
+        if (ty < 0 || ty >= height) continue
+        const rowOffset = ty * width
+        const kernelRowOffset = ky * size
+
+        for (let kx = 0; kx < size; kx++) {
+          const tx = px + kx
+          if (tx < 0 || tx >= width) continue
+
+          const kernelVal = kernel[kernelRowOffset + kx]
+          if (kernelVal > 0) {
+            const idx = rowOffset + tx
+            const srcAlpha = alpha * kernelVal
+            alphaBuffer[idx] = alphaBuffer[idx] + srcAlpha * (1 - alphaBuffer[idx])
+          }
+        }
+      }
+    }
+
+    const imageData = this.ctx.createImageData(width, height)
+    const pixels = imageData.data
+    const palette = this._palette
+    const opacity = this._opacity
+    const maxOpacity = this._maxOpacity
+    const minOpacity = this._minOpacity
+    const useGradientOpacity = this._useGradientOpacity
+
+    for (let i = 0; i < alphaBuffer.length; i++) {
+      const alphaVal = alphaBuffer[i]
+      if (alphaVal === 0) continue
+
+      const alpha255 = Math.round(alphaVal * 255)
+      const q = alpha255 * 4
+      const pixIdx = i * 4
+
+      let finalOpacity: number
+      if (opacity > 0) {
+        finalOpacity = opacity
+      } else if (alpha255 < maxOpacity) {
+        finalOpacity = alpha255 < minOpacity ? minOpacity : alpha255
+      } else {
+        finalOpacity = maxOpacity
+      }
+
+      pixels[pixIdx] = palette[q]
+      pixels[pixIdx + 1] = palette[q + 1]
+      pixels[pixIdx + 2] = palette[q + 2]
+      pixels[pixIdx + 3] = useGradientOpacity ? palette[q + 3] : finalOpacity
+    }
+
+    this.ctx.putImageData(imageData, 0, 0)
+  }
+
   getDataURL () {
     return this.canvas.toDataURL()
   }
@@ -548,6 +685,26 @@ class HeatmapClass {
 
   repaint () {
     this._coordinator.emit('renderall', this._store._getInternalData())
+    return this
+  }
+
+  rasterSetData (obj:ISetData) {
+    const b = obj.data
+    const c = b.length
+    this._store._data = []
+    this._store.radiusArr = []
+    for (let d = 0; d < c; d++) {
+      this._store._organiseData(b[d], false)
+    }
+    this._store._max = obj.max
+    this._store._min = obj.min || 0
+    this._store._onExtremaChange()
+    this._renderer.rasterRenderAll(this._store._getInternalData())
+    return this
+  }
+
+  rasterRepaint () {
+    this._renderer.rasterRenderAll(this._store._getInternalData())
     return this
   }
 
@@ -800,6 +957,42 @@ class CHInstanceClass {
       }
 
       return this.setData(min, max, convdata, obj)
+    }
+
+    return false
+  }
+
+  rasterSetData (min: number, max: number, data: Array<ICoordinates>, obj: ID) {
+    if (data && data.length > 0) {
+      this._heatmap.rasterSetData({
+        min: min,
+        max: max,
+        data: data
+      })
+
+      this.updateLayer(obj)
+      return true
+    }
+
+    return false
+  }
+
+  rasterSetWGS84Data (min: number, max: number, data: Array<ICoordinates>, obj: ID) {
+    if (data && data.length > 0) {
+      const convdata = []
+
+      for (let i = 0; i < data.length; i++) {
+        const gp = data[i]
+
+        const hp = this.wgs84PointToHeatmapPoint(gp)
+        if (gp.value || gp.value === 0) {
+          hp.value = gp.value
+        }
+
+        convdata.push(hp)
+      }
+
+      return this.rasterSetData(min, max, convdata, obj)
     }
 
     return false
