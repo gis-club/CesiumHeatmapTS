@@ -289,7 +289,7 @@ class RendererClass {
     this.shadowCanvas = document.createElement('canvas')
     this.canvas = document.createElement('canvas')
     this._renderBoundaries = [1e4, 1e4, 0, 0]
-    const g = getComputedStyle(container) || {}
+    const g = getComputedStyle(container)
     this.canvas.className = 'heatmap-canvas'
     this._width = this.canvas.width = this.shadowCanvas.width = +g.width.replace(/px/, '')
     this._height = this.canvas.height = this.shadowCanvas.height = +g.height.replace(/px/, '')
